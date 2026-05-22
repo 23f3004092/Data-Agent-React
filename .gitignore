@@ -1,0 +1,28 @@
+# Environment files
+.env
+backend/.env
+frontend/.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Node artifacts
+frontend/node_modules/
+frontend/dist/
+
+# VS Code
+.vscode/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
