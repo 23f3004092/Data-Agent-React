@@ -61,7 +61,7 @@ router → [researcher ⇄ research_tools] → [analyst ⇄ analyst_tools] → s
 
 - **router** (LLM, JSON): decides if web research is needed; falls back to a URL/keyword heuristic on error. Skips the researcher when local files suffice.
 - **researcher** (ReAct loop, tools: `search_web`/`scrape_url`/`list_files`): gathers sourced facts, final message = `RESEARCH NOTES`. Search uses `ddgs` (no API key).
-- **analyst** (ReAct loop, tools: `list_files`/`analyze_data`/`group_stats`/`correlate`/`create_chart`/`save_table`): works from actual data — chart type chosen from column metadata, not hardcoded. Can end its message with `NEED_MORE_RESEARCH: …` to bounce back to the researcher **once** (`bounce_used` guard makes a second bounce impossible).
+- **analyst** (ReAct loop, tools: `list_files`/`analyze_data`/`group_stats`/`correlate`/`run_python`/`create_chart`/`save_table`): EDA-first — `analyze_data` returns `column_roles` (geo_country/geo_lat/geo_lon/datetime/numeric_money/categorical/…), cardinality and time_ranges; fixed tools cover common ops, `run_python(code, file_path?)` covers everything else (filters, joins, time-series, outliers). The sandbox is two-layer: a **static AST gate** in-process (rejects foreign imports, dunders, `open/eval/exec`, URLs, absolute/`..` paths) plus a **fresh `python -I -c` subprocess** with cwd confined to the chat dir, 20s kill timeout, 8KB output cap. Charts use a **registry of 17 types** — incl. `choropleth`/`map_scatter` (bundled `backend/assets/world.geo.json` embedded in the chart JSON; OSM tiles — `cdn.plotly.com` is blocked so no topojson fetch), `heatmap`, `treemap`/`sunburst`, `box`/`violin`, stacked modes, `color`/`size` encodings. Can end its message with `NEED_MORE_RESEARCH: …` to bounce back to the researcher **once** (`bounce_used` guard makes a second bounce impossible).
 - **storyteller** (single LLM call): plain-text summary + self-contained HTML (Plotly from `cdn.jsdelivr.net` — `cdn.plotly.com` is DNS-blocked on this network).
 - **Termination guarantees**: per-phase tool budgets (`RESEARCH_TOOL_BUDGET`/`ANALYST_TOOL_BUDGET`) force `tool_choice="none"` when exhausted, plus `recursion_limit`. A quality gate re-asks the analyst once if numeric data exists but no `chart_*`/`table_*` file was produced.
 - **File tools are containment-checked**: `chat_dir` arrives via `config["configurable"]` (injected into tools as `RunnableConfig`), never a module global — concurrent requests can't race.
@@ -91,7 +91,7 @@ Each chat gets a directory `uploads/{chat_id}/`. All agent file tools resolve pa
 
 ## No Test Framework, No Backend Linting
 
-- No pytest config / formal test suite. Two **manual verification scripts** exist in `backend/` (run from `backend/` with `python verify_file_flow.py` / `verify_research_flow.py`; each costs several LLM calls, writes to throwaway `uploads/9999x/` dirs, and asserts on steps, chart files, and trace events).
+- No pytest config / formal test suite. Three **manual verification scripts** exist in `backend/` (run from `backend/`): `python verify_sandbox.py` (tool-level: AST gate, sandbox, EDA roles, chart registry — **no LLM calls, free**, ~30s), `python verify_file_flow.py` and `python verify_research_flow.py` (full E2E — each costs several LLM calls, writes to throwaway `uploads/9999x/` dirs, and asserts on steps, chart files, and trace events).
 - No Python formatter/linter configured (no ruff, black, mypy)
 - No type checking on backend
 - ESLint is configured for frontend only

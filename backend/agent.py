@@ -7,8 +7,10 @@ Adaptive multi-agent orchestration using LangGraph.
 - Researcher:   ReAct loop over search/scrape tools, distills sourced notes.
                 Can be re-engaged ONCE by the analyst if data is missing.
 - Analyst:      ReAct loop over pandas/plotly tools, driven by the ACTUAL
-                data (files and/or research notes): grouping, correlations,
-                and charts whose type is chosen from real column metadata.
+                data (files and/or research notes). EDA-first (column-role
+                detection: geo/datetime/money), fixed tools for common ops,
+                sandboxed run_python for everything else, and a chart registry
+                (incl. choropleth/scatter-map using bundled world geometry).
 - Storyteller:  single LLM call → plain-text summary + self-contained HTML.
 
 Conditional edges skip phases; loops are bounded by per-phase tool budgets
@@ -19,10 +21,13 @@ concurrent requests cannot race on a global).
 """
 
 import os
+import ast
 import json
 import re
+import sys
 import time
 import logging
+import subprocess
 from typing import TypedDict, List, Optional, Annotated
 from pathlib import Path
 from dotenv import load_dotenv
@@ -56,8 +61,9 @@ RETRY_WAIT_MIN = 2
 RETRY_WAIT_MAX = 10
 
 RESEARCH_TOOL_BUDGET = 10   # max tool calls for the researcher phase
-ANALYST_TOOL_BUDGET = 14    # max tool calls for the analyst phase
+ANALYST_TOOL_BUDGET = 16    # max tool calls for the analyst phase (incl. run_python)
 RECURSION_LIMIT = 90        # hard graph super-step cap (belt & braces)
+PYTHON_TIMEOUT = 20         # seconds before a run_python subprocess is killed
 
 NEED_MARKER = "NEED_MORE_RESEARCH:"   # analyst → researcher back-edge signal
 
@@ -182,6 +188,245 @@ def _viz_created_this_run(state) -> bool:
         pass
     return False
 
+# ─── Geo Support (bundled world geometry, no runtime CDN fetch) ──
+
+_WORLD_GEOJSON = None
+_COUNTRY_INDEX = None
+
+# Common short/informal labels → canonical names present in assets/world.geo.json
+_COUNTRY_ALIASES = {
+    "usa": "united states of america", "us": "united states of america",
+    "u.s.": "united states of america", "u.s.a.": "united states of america",
+    "united states": "united states of america", "america": "united states of america",
+    "uk": "united kingdom", "u.k.": "united kingdom", "great britain": "united kingdom",
+    "britain": "united kingdom", "england": "united kingdom",
+    "korea": "south korea", "republic of korea": "south korea", "s. korea": "south korea",
+    "russian federation": "russia", "czechia": "czech republic",
+    "uae": "united arab emirates", "holland": "netherlands",
+    "türkiye": "turkey", "viet nam": "vietnam", "ivory coast": "côte d'ivoire",
+    "drc": "democratic republic of the congo", "congo": "republic of the congo",
+}
+
+
+def _load_world():
+    """Bundled world GeoJSON (180 countries, ISO-3 ids). Loaded once, lazily."""
+    global _WORLD_GEOJSON
+    if _WORLD_GEOJSON is None:
+        p = Path(__file__).parent / "assets" / "world.geo.json"
+        try:
+            _WORLD_GEOJSON = json.loads(p.read_text(encoding="utf8"))
+        except Exception as e:
+            logger.warning(f"world GeoJSON unavailable ({e}) — map charts disabled")
+            _WORLD_GEOJSON = False
+    return _WORLD_GEOJSON or None
+
+
+def _country_index() -> dict:
+    """lowercase label → canonical country name (exact spelling from the GeoJSON)."""
+    global _COUNTRY_INDEX
+    if _COUNTRY_INDEX is None:
+        idx = {}
+        world = _load_world()
+        if world:
+            for feat in world.get("features", []):
+                props = feat.get("properties") or {}
+                canon = props.get("name") or ""
+                iso = feat.get("id") or props.get("iso_a3") or ""
+                if canon:
+                    idx[canon.lower()] = canon
+                if iso:
+                    idx[str(iso).lower()] = canon
+            for alias, target in _COUNTRY_ALIASES.items():
+                hit = idx.get(target.lower())
+                if hit:
+                    idx[alias] = hit
+        _COUNTRY_INDEX = idx
+    return _COUNTRY_INDEX
+
+
+def _resolve_countries(values):
+    """Map free-form country labels to canonical GeoJSON names.
+
+    Returns (canon_list_aligned_with_input, deduped_unmatched_labels);
+    canon_list entries are None where nothing matched.
+    """
+    idx = _country_index()
+    canon, unmatched, seen = [], [], set()
+    for v in values:
+        hit = idx.get(str(v).strip().lower())
+        if hit:
+            canon.append(hit)
+        else:
+            canon.append(None)
+            label = str(v)
+            if label not in seen:
+                seen.add(label)
+                unmatched.append(label)
+    return canon, unmatched
+
+
+def _detect_column_roles(df) -> dict:
+    """EDA: classify each column so the analyst can pick groupings and chart types."""
+    import pandas as pd
+    roles = {}
+    n = len(df)
+    geo_keys = set(_country_index().keys())
+    for col in df.columns:
+        name = str(col)
+        lname = name.lower().strip().replace(" ", "_")
+        try:
+            s = df[col]
+            if pd.api.types.is_datetime64_any_dtype(s):
+                roles[name] = "datetime"
+            elif pd.api.types.is_numeric_dtype(s):
+                if lname in ("lat", "latitude"):
+                    roles[name] = "geo_lat"
+                elif lname in ("lon", "lng", "long", "longitude"):
+                    roles[name] = "geo_lon"
+                elif any(k in lname for k in ("price", "revenue", "sales", "profit", "cost",
+                                              "income", "gdp", "amount", "budget", "spend",
+                                              "expenditure")):
+                    roles[name] = "numeric_money"
+                else:
+                    roles[name] = "numeric"
+            else:
+                nn = s.dropna()
+                if nn.empty:
+                    roles[name] = "empty"
+                    continue
+                uniq = nn.astype(str).str.strip().unique()
+                sample = list(uniq[:100])
+                # ≥80% of distinct values are countries on the world map → geo column
+                if geo_keys and len(sample) and len(uniq) <= 250:
+                    hits = sum(1 for v in sample if v.lower() in geo_keys)
+                    if hits / len(sample) >= 0.8:
+                        roles[name] = "geo_country"
+                        continue
+                parsed = pd.to_datetime(sample[:50], errors="coerce", format="mixed")
+                if len(parsed) and float(pd.notna(parsed).mean()) >= 0.9:
+                    roles[name] = "datetime_string"
+                elif len(uniq) <= max(20, int(0.05 * n)):
+                    roles[name] = "categorical"
+                else:
+                    roles[name] = "text"
+        except Exception:
+            roles[name] = "unknown"
+    return roles
+
+
+def _time_ranges(df, roles) -> dict:
+    """min/max timestamps for datetime(-string) columns."""
+    import pandas as pd
+    out = {}
+    for col, role in roles.items():
+        if role not in ("datetime", "datetime_string"):
+            continue
+        try:
+            s = df[col]
+            ts = s if role == "datetime" else pd.to_datetime(s, errors="coerce", format="mixed")
+            out[col] = [str(ts.min())[:19], str(ts.max())[:19]]
+        except Exception:
+            continue
+    return out
+
+# ─── Sandboxed Python (for the analyst's run_python tool) ───────────
+
+_PY_ALLOWED_IMPORTS = {
+    "pandas", "numpy", "json", "math", "statistics", "itertools", "functools",
+    "datetime", "re", "collections", "random", "string", "calendar", "decimal", "time",
+}
+_PY_DENIED_NAMES = {
+    "open", "eval", "exec", "compile", "__import__", "input", "breakpoint",
+    "globals", "locals", "exit", "quit", "vars",
+}
+_PY_DENIED_ATTRS = {
+    "system", "popen", "Popen", "urlopen", "urlretrieve", "socket", "connect",
+    "fork", "execv", "execve", "spawn", "kill", "killpg",
+}
+_PY_MAX_LEN = 8000
+
+
+def _validate_python(code: str):
+    """Static AST gate for run_python. Returns None if acceptable, else a reason.
+
+    Deliberately an accident/hallucination guard, not a hard security boundary —
+    execution isolation (fresh subprocess, cwd confinement, timeout) is the
+    second layer. Blocks: foreign imports, dunder walking, open/eval/exec,
+    network URLs, absolute and parent (..) paths.
+    """
+    if len(code) > _PY_MAX_LEN:
+        return f"code too long ({len(code)} > {_PY_MAX_LEN} chars)"
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return f"syntax error: {e}"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                root = a.name.split(".")[0]
+                if root not in _PY_ALLOWED_IMPORTS:
+                    return f"import '{root}' is not allowed (allowed: {sorted(_PY_ALLOWED_IMPORTS)})"
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0] if node.module else ""
+            if node.level or root not in _PY_ALLOWED_IMPORTS:
+                return f"import from '{node.module}' is not allowed"
+        elif isinstance(node, ast.Name):
+            if node.id in _PY_DENIED_NAMES:
+                return f"'{node.id}' is not allowed"
+            if "__" in node.id:
+                return "dunder names are not allowed"
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _PY_DENIED_ATTRS:
+                return f"'{node.attr}' is not allowed"
+            if "__" in node.attr:
+                return "dunder attributes are not allowed"
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            v = node.value
+            if "__" in v:
+                return "strings containing dunder names are not allowed"
+            if re.search(r"\b(?:https?|ftp|file)://", v) or v.startswith("//"):
+                return "network URLs are not allowed"
+            if re.match(r"^\s*(?:[A-Za-z]:[\\/]|/|\\\\|\.\.)", v):
+                return "absolute or parent (..) paths are not allowed — use file names inside the chat directory"
+    return None
+
+
+def _exec_python(code: str, file_path: str, chat_dir: str) -> str:
+    """Run code in a fresh isolated subprocess (see run_python tool)."""
+    imports_line = (
+        "import pandas as pd, numpy as np, json, math, statistics, itertools, "
+        "functools, re, collections, datetime, random, string, calendar\n"
+    )
+    load_line = ""
+    if file_path:
+        reader = {".csv": "read_csv", ".json": "read_json",
+                  ".xlsx": "read_excel", ".xls": "read_excel"}.get(Path(file_path).suffix.lower())
+        if reader:
+            load_line = f'df = pd.{reader}(r"""{file_path}""")\n'
+    script = imports_line + load_line + code + "\n"
+
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", script],
+            cwd=chat_dir, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=PYTHON_TIMEOUT, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: code timed out after {PYTHON_TIMEOUT}s — simplify it or work on a smaller slice of the data."
+    except Exception as e:
+        return f"Error launching python: {e}"
+
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        tail = err[-3000:] if len(err) > 3000 else err
+        return f"Code failed:\n{tail}"
+    if not out:
+        return "Code ran successfully but produced no output — print() the results you need."
+    return out[:8000] + ("\n…[output truncated]" if len(out) > 8000 else "")
+
 # ─── Tools ───────────────────────────────────────────────
 # Three groups of concerns: research (web), analysis (pandas), output (charts/tables).
 
@@ -256,7 +501,10 @@ def scrape_url(url: str, max_chars: int = 6000, config: Annotated[RunnableConfig
 
 @tool
 def analyze_data(file_path: str, columns: str = "", config: Annotated[RunnableConfig, "runnable config"] = None) -> str:
-    """Profile a data file (csv/json/xlsx): shape, columns, dtypes, stats, head, nulls.
+    """EDA profile of a data file: shape, dtypes, stats, head, nulls, cardinality,
+    and column_roles (numeric / numeric_money / categorical / text / geo_country /
+    geo_lat / geo_lon / datetime / datetime_string) — column_roles decides which
+    groupings and chart types make sense.
 
     file_path: path to the file (inside this chat's directory).
     columns: optional comma-separated subset to profile (keeps output small).
@@ -273,11 +521,15 @@ def analyze_data(file_path: str, columns: str = "", config: Annotated[RunnableCo
                 return f"Columns not found: {missing}. Available: {list(df.columns)}"
             df = df[wanted]
 
+        roles = _detect_column_roles(df)
         result = {
             "file": path.name,
             "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
             "columns": list(df.columns),
             "dtypes": {k: str(v) for k, v in df.dtypes.items()},
+            "column_roles": roles,
+            "cardinality": {str(c): int(df[c].nunique()) for c in df.columns},
+            "time_ranges": _time_ranges(df, roles),
             "summary": json.loads(df.describe().to_json()),
             "head": json.loads(df.head(10).to_json(orient="records")),
             "null_counts": {k: int(v) for k, v in df.isnull().sum().items()},
@@ -355,59 +607,203 @@ def correlate(file_path: str, columns: str = "all",
 
 
 @tool
+def run_python(code: str, file_path: str = "",
+               config: Annotated[RunnableConfig, "runnable config"] = None) -> str:
+    """Execute Python for analysis the fixed tools can't do: filters, joins, time-series
+    resampling, outliers, rankings across conditions, multi-step metrics, formatting.
+
+    Runs in an isolated subprocess (no network, files confined to this chat directory,
+    20s timeout). pandas/numpy/json/math/statistics/itertools/re/datetime/collections/
+    random/string/calendar are preloaded (pd and np already imported). print() your
+    results — whatever is printed is returned to you.
+
+    code:      Python source (max 8000 chars).
+    file_path: data file to preload as `df` (csv/json/xlsx). Optional: if omitted and the
+               directory holds exactly one data file, that one is loaded automatically.
+    """
+    try:
+        chat_dir = _chat_dir(config)
+
+        err = _validate_python(code)
+        if err:
+            return f"Rejected: {err}"
+
+        resolved = ""
+        if file_path:
+            try:
+                resolved = str(_resolve_file(chat_dir, file_path))
+            except ValueError as e:
+                return str(e)
+        else:
+            data_files = [f for f in sorted(chat_dir.iterdir())
+                          if f.is_file() and f.suffix.lower() in (".csv", ".json", ".xlsx", ".xls")
+                          and not f.name.startswith("chart_")]
+            if len(data_files) == 1:
+                resolved = str(data_files[0])
+
+        return _exec_python(code, resolved, str(chat_dir))
+    except Exception as e:
+        return f"Error in run_python: {e}"
+
+
+@tool
 def create_chart(data: str, chart_type: str, title: str, x: str = "", y: str = "",
+                 color: str = "", mode: str = "", size: str = "",
                  config: Annotated[RunnableConfig, "runnable config"] = None) -> str:
     """Render a Plotly chart and save it as chart_<n>.json in this chat's directory.
 
-    data:       JSON — either a list of row objects (as returned by group_stats)
-                or a dict of equal-length arrays.
-    chart_type: bar | line | area | scatter | pie | histogram
-                (time → line/area, categories → bar, distribution → histogram,
-                 parts of a whole → pie, relationship → scatter)
-    x, y:       column/field names for the axes (pie: x = labels, y = values).
+    data:       JSON list of row objects (records), dict of equal-length arrays, or
+                (heatmap only) a 2D array — list of lists, e.g. correlate() output.
+    chart_type: bar | stacked_bar | line | area | stacked_area | scatter | bubble |
+                pie | histogram | box | violin | heatmap | funnel | treemap | sunburst |
+                choropleth | map_scatter
+                Choose by data shape: time→line/area · categories→bar · stacked parts→
+                stacked_bar/stacked_area · geo_country column→choropleth · lat/lon cols→
+                map_scatter · distribution→histogram/box/violin · relationship→scatter/
+                bubble · correlation matrix→heatmap · parts→pie/funnel · hierarchy→
+                treemap/sunburst.
+    x, y:       column names. pie/funnel: x=labels, y=values. treemap/sunburst: x=hierarchy
+                path (comma-separated columns), y=values. choropleth: x=country column,
+                y=value column. map_scatter: x=lon column, y=lat column. heatmap: optional
+                comma-separated tick labels.
+    color:      grouping column → legend (or continuous color where numeric).
+    mode:       "stacked" or "grouped" (bar/area).
+    size:       value column for bubble / map_scatter point size.
     """
     import plotly.express as px
+    import pandas as pd
 
-    try:
-        chat_dir = _chat_dir(config)
-        data_obj = json.loads(data) if isinstance(data, str) else data
-        if isinstance(data_obj, dict) and not isinstance(data_obj, (list, tuple)):
-            # dict of arrays or {"data": ...} wrapper — px accepts both dict forms
-            pass
-        if not isinstance(data_obj, (list, dict)):
-            return "data must be a JSON list of row objects or a dict of arrays"
-
-        xy = {}
-        if x:
-            xy["x"] = x
-        if y:
-            xy["y"] = y
-
-        ct = (chart_type or "bar").lower()
-        if ct == "bar":
-            fig = px.bar(data_obj, **xy)
-        elif ct == "line":
-            fig = px.line(data_obj, **xy)
-        elif ct == "area":
-            fig = px.area(data_obj, **xy)
-        elif ct == "scatter":
-            fig = px.scatter(data_obj, **xy)
-        elif ct == "pie":
-            fig = px.pie(data_obj, **xy)
-        elif ct == "histogram":
-            fig = px.histogram(data_obj, **xy)
-        else:
-            fig = px.bar(data_obj, **xy)
-
+    def _finish(fig, note=""):
         fig.update_layout(title=title, template="plotly_white")
-
         idx = 1
         while (chat_dir / f"chart_{idx}.json").exists():
             idx += 1
         file_name = f"chart_{idx}.json"
-        target = chat_dir / file_name
-        target.write_text(fig.to_json(), encoding="utf8")
-        return f"Saved {file_name} ({ct} chart, title '{title}'). Reference it when you describe charts."
+        (chat_dir / file_name).write_text(fig.to_json(), encoding="utf8")
+        return f"Saved {file_name} ({ct} chart{note}, title '{title}'). Reference it when you describe charts."
+
+    try:
+        chat_dir = _chat_dir(config)
+        data_obj = json.loads(data) if isinstance(data, str) else data
+
+        ct = (chart_type or "bar").lower().strip()
+        stacked = (mode or "").lower().strip() in ("stacked", "stack")
+        if ct == "stacked_bar":
+            ct, stacked = "bar", True
+        elif ct == "stacked_area":
+            ct, stacked = "area", True
+        color_kw = {"color": color} if color else {}
+
+        # ── matrix branch: heatmap takes a 2D array directly ──
+        if ct == "heatmap":
+            if not (isinstance(data_obj, list) and data_obj and isinstance(data_obj[0], list)):
+                return "heatmap data must be a 2D array (list of lists), e.g. a correlation matrix"
+            labels_x = [s.strip() for s in x.split(",") if s.strip()] or None
+            labels_y = [s.strip() for s in y.split(",") if s.strip()] or None
+            fig = px.imshow(data_obj, x=labels_x, y=labels_y)
+            return _finish(fig)
+
+        # ── everything else: records / dict-of-arrays → DataFrame ──
+        try:
+            df = pd.DataFrame(data_obj)
+        except Exception:
+            return "data must be a list of row objects or a dict of equal-length arrays"
+        if df.empty or len(df.columns) == 0:
+            return "data is empty"
+
+        # treemap/sunburst x is a comma-separated hierarchy path, not one column
+        if ct in ("treemap", "sunburst") and x:
+            wanted = [p.strip() for p in x.split(",") if p.strip()] + [c for c in (y, color, size) if c]
+        else:
+            wanted = [c for c in (x, y, color, size) if c]
+        missing = [c for c in wanted if c not in df.columns]
+        if missing:
+            return f"Columns not found: {missing}. Available: {list(df.columns)}"
+
+        note = ""
+
+        if ct == "bar":
+            fig = px.bar(df, x=x or None, y=y or None, **color_kw)
+            if stacked:
+                fig.update_layout(barmode="stack")
+        elif ct == "line":
+            fig = px.line(df, x=x or None, y=y or None, **color_kw)
+        elif ct == "area":
+            fig = px.area(df, x=x or None, y=y or None, **color_kw)
+            if stacked:
+                fig.update_traces(stackgroup=1)
+        elif ct in ("scatter", "bubble"):
+            if ct == "bubble" and not size:
+                return "bubble needs size=<value column> (or use scatter)"
+            fig = px.scatter(df, x=x or None, y=y or None, size=size or None, **color_kw)
+        elif ct == "pie":
+            if not (x and y):
+                return "pie needs x=<label column> and y=<value column>"
+            fig = px.pie(df, names=x, values=y, **color_kw)
+        elif ct == "histogram":
+            fig = px.histogram(df, x=x or None, y=y or None, **color_kw)
+        elif ct in ("box", "violin"):
+            fn = px.box if ct == "box" else px.violin
+            if y:
+                fig = fn(df, x=x or None, y=y, **color_kw)
+            elif x and pd.api.types.is_numeric_dtype(df[x]):
+                fig = fn(df, y=x, **color_kw)
+            else:
+                return f"{ct} needs y=<value column> (optionally x=<group column>), or x=<numeric column>"
+        elif ct == "funnel":
+            if not (x and y):
+                return "funnel needs x=<stage labels> and y=<values>"
+            fig = px.funnel(df, x=x, y=y, **color_kw)
+        elif ct in ("treemap", "sunburst"):
+            if not (x and y):
+                return f"{ct} needs x=<hierarchy path, comma-separated> and y=<values>"
+            path = [c.strip() for c in x.split(",") if c.strip()]
+            missing_path = [c for c in path if c not in df.columns]
+            if missing_path:
+                return f"Columns not found: {missing_path}. Available: {list(df.columns)}"
+            fn = px.treemap if ct == "treemap" else px.sunburst
+            fig = fn(df, path=path, values=y, **color_kw)
+        elif ct == "choropleth":
+            world = _load_world()
+            if not world:
+                return "Map charts are unavailable (world geometry asset missing)."
+            if not (x and y):
+                return "choropleth needs x=<country column> and y=<value column>"
+            if not pd.api.types.is_numeric_dtype(df[y]):
+                return f"choropleth y must be numeric, column '{y}' is {df[y].dtype}"
+            canon, unmatched = _resolve_countries(df[x].tolist())
+            keep = [i for i, c in enumerate(canon) if c is not None]
+            if not keep:
+                return (f"None of the values in '{x}' matched a country on the world map. "
+                        f"Examples seen: {unmatched[:10]}")
+            if unmatched:
+                note = f"; {len(unmatched)} unmatched locations dropped: {unmatched[:6]}"
+            d = df.iloc[keep].copy()
+            d["__country__"] = [canon[i] for i in keep]
+            fig = px.choropleth_map(
+                d, geojson=world, locations="__country__", color=y,
+                featureidkey="properties.name", map_style="open-street-map",
+                zoom=0.8,
+            )
+        elif ct == "map_scatter":
+            if not (x and y):
+                return "map_scatter needs x=<lon column> and y=<lat column>"
+            d = df.copy()
+            d[x] = pd.to_numeric(d[x], errors="coerce")
+            d[y] = pd.to_numeric(d[y], errors="coerce")
+            d = d.dropna(subset=[x, y])
+            if d.empty:
+                return f"map_scatter found no numeric lat/lon pairs in '{y}'/'{x}'"
+            fig = px.scatter_map(
+                d, lat=y, lon=x, size=size or None, **color_kw,
+                map_style="open-street-map", zoom=1, size_max=24,
+            )
+        else:
+            return (f"Unknown chart_type '{chart_type}'. Valid: bar, stacked_bar, line, area, "
+                    f"stacked_area, scatter, bubble, pie, histogram, box, violin, heatmap, "
+                    f"funnel, treemap, sunburst, choropleth, map_scatter")
+
+        return _finish(fig, note)
     except Exception as e:
         return f"Error creating chart: {e}"
 
@@ -444,7 +840,7 @@ def save_table(file_name: str, data_json: str,
 
 
 RESEARCH_TOOLS = [list_files, search_web, scrape_url]
-ANALYST_TOOLS = [list_files, analyze_data, group_stats, correlate, create_chart, save_table]
+ANALYST_TOOLS = [list_files, analyze_data, group_stats, correlate, run_python, create_chart, save_table]
 
 # ─── LLM Setup ───────────────────────────────────────────
 
@@ -498,7 +894,7 @@ Tools: search_web(query), scrape_url(url), list_files().
 
 Method:
 1. If the brief contains a URL — scrape it first, then search around it.
-2. Otherwise run 2-3 focused search_web queries; scrape_url the 2-4 most promising results.
+2. Otherwise run 5-6 focused search_web queries; scrape_url the 2-6 most promising results.
 3. Extract CONCRETE facts: numbers, dates, quantities, rankings, growth rates, percentages — prefer recent data.
 
 When you have 8-15 solid facts (or the tool budget is reached), STOP calling tools and give your FINAL message with no tool calls, exactly:
@@ -525,19 +921,29 @@ Available files: {files}
 Research notes so far: {notes}
 {extra}
 Tools: list_files(), analyze_data(file_path, columns?), group_stats(file_path, group_by, aggregations),
-correlate(file_path, columns?), create_chart(data, chart_type, title, x?, y?), save_table(file_name, data_json).
+correlate(file_path, columns?), run_python(code, file_path?),
+create_chart(data, chart_type, title, x?, y?, color?, mode?, size?), save_table(file_name, data_json).
 
-Method:
-1. list_files(). If files exist, analyze_data the RELEVANT one(s) first.
-2. Then answer the actual question — generic profiles are not enough:
-   group_stats for breakdowns/comparisons (e.g. {{"revenue":"sum"}} by "region"),
-   correlate for relationships between numeric columns.
-3. No files but the research notes contain numbers? Build a small table with
-   save_table (rows derived from the notes; put "illustrative": true on rows
-   you had to estimate, never on sourced ones).
-4. Charts: create_chart for the 1-3 comparisons that best carry the story.
-   Choose type by data shape: time→line/area, categories→bar, distribution→histogram,
-   parts of a whole→pie, relationship→scatter. Pass group_stats output straight as data.
+PROTOCOL (strict order):
+1. EDA FIRST: analyze_data on the relevant file. Read column_roles (numeric / numeric_money /
+   categorical / text / geo_country / geo_lat / geo_lon / datetime / datetime_string),
+   cardinality and time_ranges — they decide your groupings and chart types.
+2. Answer the ACTUAL question (a generic profile is not enough):
+   - group_stats when a group-by aggregation fits — its output is chart-ready.
+   - correlate for numeric relationships.
+   - run_python for everything else: filters, joins, time-series resampling, outliers,
+     rankings across conditions, multi-step metrics, formatting. df is preloaded when you
+     pass file_path; print() the result. Only pandas/numpy/json/math/itertools/re/
+     datetime/collections are available — the sandbox has NO network access.
+3. No files, but the research notes contain numbers? save_table a small table from the
+   notes (put "illustrative": true on rows you had to estimate, never on sourced ones).
+4. Charts (1-3 that best carry the story) — choose by shape:
+   time series → line/area · categories → bar · stacked parts → stacked_bar/stacked_area
+   geo_country column → choropleth (x=country, y=value) · lat/lon columns → map_scatter (x=lon, y=lat)
+   distribution → histogram/box/violin · relationship → scatter/bubble (size=<col>)
+   correlation matrix (2D list) → heatmap · parts of a whole → pie/funnel
+   hierarchy → treemap/sunburst (x = comma-separated path, y = values)
+   Optional: color=<group col> legend/color-scale, mode=stacked|grouped for bar/area.
 
 OUTPUT GATE (mandatory): if ANY numbers are available (research notes or data files),
 you are not done until at least one table (save_table) and at least one chart
@@ -555,7 +961,7 @@ CHARTS
 LIMITATIONS
 - <data gaps or estimates, or "none">
 
-Every finding must trace to a file, a chart, or the research notes."""
+Every finding must trace to a file, a chart, run_python output, or the research notes."""
 
 STORYTELLER_PROMPT = """You are a data storyteller. Turn the material below into ONE self-contained HTML data story.
 
@@ -770,8 +1176,12 @@ def storyteller_node(state: AgentState) -> dict:
         if isinstance(m, AIMessage):
             for tc in getattr(m, "tool_calls", None) or []:
                 args = tc.get("args") or {}
-                key = (args.get("query") or args.get("url") or args.get("file_path")
-                       or args.get("group_by") or args.get("title") or "")
+                if tc.get("name") == "run_python":
+                    code_lines = (args.get("code") or "").strip().splitlines()
+                    key = code_lines[0] if code_lines else ""
+                else:
+                    key = (args.get("query") or args.get("url") or args.get("file_path")
+                           or args.get("group_by") or args.get("title") or "")
                 label = f"{tc.get('name', 'tool')}" + (f"({str(key)[:60]})" if key else "")
                 if label not in seen:
                     seen.add(label)
