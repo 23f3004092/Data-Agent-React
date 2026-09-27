@@ -1,24 +1,15 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { thunderPalette } from '../theme/thunderTheme';
+import { vb } from '../theme/voiceBox';
 
-const GRID_CSS = `
-  html, body, #root {
-    height: 100% !important;
-    min-height: 100vh !important;
-  }
-`;
-
-// Bolt logo SVG
 export function BoltIcon({ size = 24, style = {} }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
-      style={{ animation: 'boltFlicker 4s ease-in-out infinite', ...style }}>
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" style={style}>
       <path
         d="M13 2L4.5 13.5H11L10 22L19.5 10.5H13L13 2Z"
-        fill={thunderPalette.accent}
-        stroke={thunderPalette.accent}
+        fill={vb.red}
+        stroke={vb.red}
         strokeWidth="0.5"
         strokeLinejoin="round"
       />
@@ -42,7 +33,8 @@ export default function NavBar() {
       alignItems: 'center',
       justifyContent: 'space-between',
       padding: '14px 24px',
-      borderBottom: `1px solid ${thunderPalette.line}`,
+      borderBottom: `2px solid ${vb.black}`,
+      background: vb.white,
       zIndex: 10,
     }}>
       <button
@@ -55,10 +47,11 @@ export default function NavBar() {
       >
         <BoltIcon />
         <span style={{
-          fontFamily: thunderPalette.ffHead,
-          fontWeight: 800, fontSize: 22,
-          letterSpacing: '0.06em', textTransform: 'uppercase',
-          color: thunderPalette.white,
+          fontFamily: vb.ffDisplay,
+          fontSize: 22,
+          letterSpacing: '0.02em',
+          textTransform: 'uppercase',
+          color: vb.black,
         }}>
           Data Agent
         </span>
@@ -68,23 +61,33 @@ export default function NavBar() {
         {user && (
           <>
             <span style={{
-              fontFamily: thunderPalette.ffHead, fontSize: 12,
-              fontWeight: 600, letterSpacing: '0.1em', textTransform: 'uppercase',
-              color: thunderPalette.mid,
+              fontFamily: vb.ffBody,
+              fontSize: 12,
+              fontWeight: 600,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+              color: vb.textSecondary,
             }}>
               {user.username}
             </span>
             <button
               onClick={handleLogout}
               style={{
-                fontFamily: thunderPalette.ffHead, fontWeight: 700,
-                fontSize: 12, letterSpacing: '0.1em', textTransform: 'uppercase',
+                fontFamily: vb.ffBody,
+                fontWeight: 700,
+                fontSize: 12,
+                letterSpacing: '0.06em',
+                textTransform: 'uppercase',
                 background: 'transparent',
-                border: `1px solid rgba(124,58,237,0.35)`,
-                color: thunderPalette.accent,
-                borderRadius: 4, padding: '6px 14px', cursor: 'pointer',
-                transition: 'all 0.2s',
+                border: `2px solid ${vb.black}`,
+                color: vb.black,
+                borderRadius: 0,
+                padding: '6px 14px',
+                cursor: 'pointer',
+                transition: 'all 0.15s',
               }}
+              onMouseEnter={e => { e.target.style.background = vb.black; e.target.style.color = vb.white; }}
+              onMouseLeave={e => { e.target.style.background = 'transparent'; e.target.style.color = vb.black; }}
             >
               Logout
             </button>

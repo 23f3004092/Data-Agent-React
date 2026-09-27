@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { thunderPalette } from '../theme/thunderTheme';
+import { vb } from '../theme/voiceBox';
 import { BoltIcon } from '../components/NavBar';
 
 export default function Auth() {
@@ -61,175 +61,167 @@ export default function Auth() {
 
   const inputStyle = (name) => ({
     width: '100%',
-    padding: '12px 16px',
-    background: 'rgba(245,244,240,0.04)',
-    border: `1px solid ${focused === name ? thunderPalette.accent : thunderPalette.line}`,
-    borderRadius: 4,
-    color: thunderPalette.white,
-    fontFamily: thunderPalette.ffBody,
-    fontSize: 15,
-    fontWeight: 300,
+    padding: '12px 14px',
+    background: vb.white,
+    border: `2px solid ${focused === name ? vb.black : vb.borderMedium}`,
+    borderRadius: 0,
+    fontFamily: vb.ffBody,
+    fontSize: 14,
+    fontWeight: 400,
+    color: vb.textPrimary,
     outline: 'none',
-    transition: 'border-color 0.2s, box-shadow 0.2s',
-    boxShadow: focused === name
-      ? `0 0 0 3px rgba(124,58,237,0.12)`
-      : 'none',
-    caretColor: thunderPalette.accent,
+    transition: 'border-color 0.15s',
+    boxShadow: focused === name ? `0 0 0 2px ${vb.white}, 0 0 0 4px ${vb.black}` : 'none',
   });
 
   return (
-    <>
-      {/* Grid background */}
-      <div style={{
-        position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 0,
-        backgroundImage: `
-          linear-gradient(${thunderPalette.line} 1px, transparent 1px),
-          linear-gradient(90deg, ${thunderPalette.line} 1px, transparent 1px)
-        `,
-        backgroundSize: '64px 64px',
-        animation: 'gridFade 1.2s ease both',
-      }} />
-      <div style={{
-        position: 'fixed', top: -120, left: -80, width: 480, height: 480,
-        background: 'radial-gradient(circle, rgba(124,58,237,0.12) 0%, transparent 70%)',
-        pointerEvents: 'none', zIndex: 0,
-      }} />
+    <div style={{
+      position: 'relative',
+      height: '100vh',
+      display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center',
+      padding: '1rem',
+      background: vb.bg,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: '2rem', animation: 'slideUp 0.4s ease both' }}>
+        <BoltIcon size={32} />
+        <span style={{
+          fontFamily: vb.ffDisplay,
+          fontSize: 32,
+          fontWeight: 400,
+          letterSpacing: '-0.02em',
+          textTransform: 'uppercase',
+          color: vb.black,
+        }}>
+          Data Agent
+        </span>
+      </div>
 
       <div style={{
-        position: 'relative', zIndex: 2,
-        height: '100vh', display: 'flex', flexDirection: 'column',
-        alignItems: 'center', justifyContent: 'center', padding: '1rem',
+        width: '100%',
+        maxWidth: 420,
+        background: vb.white,
+        border: `2px solid ${vb.black}`,
+        padding: '2.5rem',
+        animation: 'slideUp 0.4s 0.1s ease both',
       }}>
-        {/* Logo */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: '3rem', animation: 'slideUp 0.5s ease both' }}>
-          <BoltIcon size={32} />
-          <span style={{
-            fontFamily: thunderPalette.ffHead, fontWeight: 800,
-            fontSize: 32, letterSpacing: '0.06em', textTransform: 'uppercase',
-            color: thunderPalette.white,
-          }}>
-            Data Agent
-          </span>
+        <div style={{
+          display: 'flex',
+          borderBottom: `2px solid ${vb.borderSubtle}`,
+          marginBottom: '1.5rem',
+        }}>
+          {['Sign In', 'Sign Up'].map((label, i) => {
+            const active = i === 0 ? isLogin : !isLogin;
+            return (
+              <button key={label}
+                onClick={() => { setIsLogin(i === 0); setError(''); setSuccess(''); }}
+                style={{
+                  flex: 1,
+                  padding: '10px 0',
+                  background: 'none',
+                  border: 'none',
+                  borderBottom: active ? `3px solid ${vb.red}` : '3px solid transparent',
+                  fontFamily: vb.ffBody,
+                  fontSize: 12,
+                  fontWeight: 700,
+                  letterSpacing: '0.06em',
+                  textTransform: 'uppercase',
+                  color: active ? vb.black : vb.textTertiary,
+                  cursor: 'pointer',
+                  transition: 'color 0.15s',
+                  marginBottom: '-2px',
+                }}
+              >
+                {label}
+              </button>
+            );
+          })}
         </div>
 
-        {/* Card */}
-        <div style={{
-          width: '100%', maxWidth: 420,
-          background: 'rgba(17,17,17,0.85)',
-          backdropFilter: 'blur(16px)',
-          border: `1px solid ${thunderPalette.line}`,
-          borderRadius: 8,
-          padding: '2.5rem',
-          animation: 'slideUp 0.5s 0.1s ease both',
-          opacity: 0,
-        }}>
-          {/* Tab switcher */}
+        {error && (
           <div style={{
-            display: 'flex', borderBottom: `1px solid ${thunderPalette.line}`,
-            marginBottom: '2rem',
+            padding: '10px 14px', marginBottom: '1.5rem',
+            background: '#FEF2F2',
+            border: `2px solid ${vb.error}`,
+            color: vb.error,
+            fontFamily: vb.ffBody, fontSize: 13, fontWeight: 500,
           }}>
-            {['Sign In', 'Sign Up'].map((label, i) => {
-              const active = i === 0 ? isLogin : !isLogin;
-              return (
-                <button key={label}
-                  onClick={() => { setIsLogin(i === 0); setError(''); setSuccess(''); }}
-                  style={{
-                    flex: 1, padding: '10px 0',
-                    background: 'transparent', border: 'none',
-                    fontFamily: thunderPalette.ffHead, fontWeight: 700,
-                    fontSize: 13, letterSpacing: '0.12em', textTransform: 'uppercase',
-                    color: active ? thunderPalette.accent : thunderPalette.mid,
-                    borderBottom: `2px solid ${active ? thunderPalette.accent : 'transparent'}`,
-                    cursor: 'pointer', transition: 'all 0.2s',
-                    marginBottom: -1,
-                  }}>
-                  {label}
-                </button>
-              );
-            })}
+            {error}
+          </div>
+        )}
+
+        {success && (
+          <div style={{
+            padding: '10px 14px', marginBottom: '1.5rem',
+            background: '#F0FDF4',
+            border: `2px solid ${vb.success}`,
+            color: vb.success,
+            fontFamily: vb.ffBody, fontSize: 13, fontWeight: 500,
+          }}>
+            {success}
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <label style={{
+              fontFamily: vb.ffBody, fontSize: 12, fontWeight: 700,
+              color: vb.black, textTransform: 'uppercase', letterSpacing: '0.06em',
+            }}>Username</label>
+            <input
+              type="text" required value={username}
+              onChange={e => setUsername(e.target.value)}
+              onFocus={() => setFocused('username')}
+              onBlur={() => setFocused('')}
+              placeholder="Enter username"
+              style={inputStyle('username')}
+            />
           </div>
 
-          {error && (
-            <div style={{
-              padding: '10px 14px', marginBottom: '1.5rem',
-              background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
-              borderRadius: 4, color: '#f87171',
-              fontFamily: thunderPalette.ffBody, fontSize: 13,
-            }}>
-              {error}
-            </div>
-          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <label style={{
+              fontFamily: vb.ffBody, fontSize: 12, fontWeight: 700,
+              color: vb.black, textTransform: 'uppercase', letterSpacing: '0.06em',
+            }}>Password</label>
+            <input
+              type="password" required value={password}
+              onChange={e => setPassword(e.target.value)}
+              onFocus={() => setFocused('password')}
+              onBlur={() => setFocused('')}
+              placeholder="Enter password"
+              style={inputStyle('password')}
+            />
+          </div>
 
-          {success && (
-            <div style={{
-              padding: '10px 14px', marginBottom: '1.5rem',
-              background: 'rgba(124,58,237,0.1)', border: '1px solid rgba(124,58,237,0.3)',
-              borderRadius: 4, color: thunderPalette.accent,
-              fontFamily: thunderPalette.ffBody, fontSize: 13,
-            }}>
-              {success}
-            </div>
-          )}
-
-          <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <label style={{
-                fontFamily: thunderPalette.ffHead, fontWeight: 700,
-                fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase',
-                color: thunderPalette.mid,
-              }}>Username</label>
-              <input
-                type="text" required value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                onFocus={() => setFocused('username')}
-                onBlur={() => setFocused('')}
-                placeholder="Enter username"
-                style={inputStyle('username')}
-              />
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <label style={{
-                fontFamily: thunderPalette.ffHead, fontWeight: 700,
-                fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase',
-                color: thunderPalette.mid,
-              }}>Password</label>
-              <input
-                type="password" required value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                onFocus={() => setFocused('password')}
-                onBlur={() => setFocused('')}
-                placeholder="Enter password"
-                style={inputStyle('password')}
-              />
-            </div>
-
-            <button
-              type="submit"
-              disabled={loading}
-              style={{
-                marginTop: 8, padding: '13px',
-                background: loading ? thunderPalette.grey : thunderPalette.accent,
-                color: loading ? thunderPalette.mid : thunderPalette.black,
-                border: 'none', borderRadius: 4, cursor: loading ? 'not-allowed' : 'pointer',
-                fontFamily: thunderPalette.ffHead, fontWeight: 800,
-                fontSize: 14, letterSpacing: '0.12em', textTransform: 'uppercase',
-                transition: 'all 0.2s',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-              }}
-            >
-              {loading ? (
-                <span style={{
-                  width: 16, height: 16, borderRadius: '50%',
-                  border: '2px solid var(--mid)', borderTopColor: 'var(--white)',
-                  animation: 'spin 0.7s linear infinite', display: 'inline-block',
-                }} />
-              ) : null}
-              {loading ? 'Please wait…' : (isLogin ? 'Sign In' : 'Create Account')}
-            </button>
-          </form>
-        </div>
+          <button
+            type="submit"
+            disabled={loading}
+            style={{
+              marginTop: 8, padding: '13px',
+              background: loading ? vb.surfaceRaised : vb.black,
+              color: loading ? vb.textTertiary : vb.white,
+              border: `2px solid ${loading ? vb.borderMedium : vb.black}`,
+              borderRadius: 0,
+              fontFamily: vb.ffBody, fontSize: 13, fontWeight: 700,
+              letterSpacing: '0.06em', textTransform: 'uppercase',
+              cursor: loading ? 'not-allowed' : 'pointer',
+              transition: 'all 0.15s',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+            }}
+            onMouseEnter={e => { if (!loading) { e.target.style.background = vb.red; e.target.style.borderColor = vb.red; } }}
+            onMouseLeave={e => { if (!loading) { e.target.style.background = vb.black; e.target.style.borderColor = vb.black; } }}
+          >
+            {loading && (
+              <span style={{
+                width: 14, height: 14, borderRadius: '50%',
+                border: '2px solid currentColor', borderTopColor: 'transparent',
+                animation: 'spin 0.7s linear infinite', display: 'inline-block',
+              }} />
+            )}
+            {loading ? 'Please wait…' : (isLogin ? 'Sign In' : 'Create Account')}
+          </button>
+        </form>
       </div>
-    </>
+    </div>
   );
 }
