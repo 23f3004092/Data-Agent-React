@@ -7,5 +7,14 @@ passlib[bcrypt]
 langchain
 langchain_experimental
 langchain_openai
+langchain_core
+langgraph
+langgraph-checkpoint
 pydantic
 python-dotenv
+tenacity
+httpx
+beautifulsoup4
+pandas
+plotly
+aiofiles

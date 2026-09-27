@@ -3,21 +3,32 @@ import json
 import asyncio
 import queue as q_module
 import threading
+import logging
+from typing import List
 
 from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from sqlalchemy.orm import Session
 from fastapi.security import OAuth2PasswordRequestForm
-from typing import List
 
 import models, schemas, auth, database, agent
 from database import engine
 from agent import TraceCallbackHandler
 
+# ─── Logging ─────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ─── App Setup ───────────────────────────────────────────
+
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+app = FastAPI(title="Data Agent API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,7 +38,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── helpers ────────────────────────────────────────────────
+REQUEST_TIMEOUT = 300  # 5 minutes
+
+
+# ─── Helpers ─────────────────────────────────────────────
 
 def _build_agent_messages(chat_id: int, db_messages, new_prompt: str):
     """Build the full message list the agent will receive."""
@@ -49,7 +63,7 @@ def _build_agent_messages(chat_id: int, db_messages, new_prompt: str):
         else:
             if "text" in content_dict:
                 summary = content_dict["text"]
-                files   = content_dict.get("names_of_required_files", [])
+                files = content_dict.get("names_of_required_files", [])
                 msgs.append({
                     "role": "assistant",
                     "content": f"{summary}\n\n[ARTIFACTS] Files: {', '.join(files)}"
@@ -63,7 +77,29 @@ def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-# ─── auth endpoints ──────────────────────────────────────────
+async def read_chat_files_async(chat_dir: str) -> dict:
+    """Asynchronously read JSON and CSV files from chat directory."""
+    files_data = {}
+    if not os.path.exists(chat_dir):
+        return files_data
+
+    for f_name in os.listdir(chat_dir):
+        if f_name.endswith('.json') or f_name.endswith('.csv'):
+            file_path = os.path.join(chat_dir, f_name)
+            if os.path.isfile(file_path):
+                try:
+                    # Use asyncio.to_thread for non-blocking file I/O
+                    content = await asyncio.to_thread(
+                        lambda: open(file_path, "r", encoding="utf8").read()
+                    )
+                    files_data[f_name] = content
+                except Exception as e:
+                    logger.error(f"Error reading file {f_name}: {e}")
+
+    return files_data
+
+
+# ─── Auth Endpoints ──────────────────────────────────────
 
 @app.post("/auth/register", response_model=schemas.UserResponse)
 def register(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
@@ -76,6 +112,7 @@ def register(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     db.commit()
     db.refresh(new_user)
     return new_user
+
 
 @app.post("/auth/login", response_model=schemas.Token)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
@@ -90,12 +127,13 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-# ─── chat endpoints ──────────────────────────────────────────
+# ─── Chat Endpoints ──────────────────────────────────────
 
 @app.get("/chats", response_model=List[schemas.ChatResponse])
 def get_chats(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
     chats = db.query(models.Chat).filter(models.Chat.user_id == current_user.id).all()
     return chats
+
 
 @app.post("/chats", response_model=schemas.ChatResponse)
 def create_chat(chat: schemas.ChatCreate, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
@@ -105,31 +143,20 @@ def create_chat(chat: schemas.ChatCreate, current_user: models.User = Depends(au
     db.refresh(new_chat)
     return new_chat
 
+
 @app.get("/chats/{chat_id}/messages", response_model=List[schemas.MessageResponse])
-def get_messages(chat_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
+async def get_messages(chat_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
     chat = db.query(models.Chat).filter(models.Chat.id == chat_id, models.Chat.user_id == current_user.id).first()
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     messages = db.query(models.Message).filter(models.Message.chat_id == chat_id).all()
-    
-    # Detach messages from session to prevent auto-saving transient content injections
+
     for msg in messages:
         db.expunge(msg)
-        
-    # Dynamically read JSON and CSV files from the chat folder and inject them
+
     chat_dir = os.path.join("uploads", str(chat_id))
-    files_data = {}
-    if os.path.exists(chat_dir):
-        for f_name in os.listdir(chat_dir):
-            if f_name.endswith('.json') or f_name.endswith('.csv'):
-                file_path = os.path.join(chat_dir, f_name)
-                if os.path.isfile(file_path):
-                    try:
-                        with open(file_path, "r", encoding="utf8") as f:
-                            files_data[f_name] = f.read()
-                    except Exception as e:
-                        print(f"Error reading file {f_name} during messages fetch: {e}")
-                        
+    files_data = await read_chat_files_async(chat_dir)
+
     for msg in messages:
         if msg.role == "assistant":
             try:
@@ -141,8 +168,9 @@ def get_messages(chat_id: int, current_user: models.User = Depends(auth.get_curr
                     msg.content = json.dumps(parsed)
             except Exception:
                 pass
-                
+
     return messages
+
 
 @app.post("/chats/{chat_id}/upload")
 async def upload_file(chat_id: int, file: UploadFile = File(...), current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
@@ -157,7 +185,7 @@ async def upload_file(chat_id: int, file: UploadFile = File(...), current_user: 
     return {"filename": file.filename, "path": file_path}
 
 
-# ─── streaming message endpoint ──────────────────────────────
+# ─── Streaming Message Endpoint ──────────────────────────
 
 @app.post("/chats/{chat_id}/message/stream")
 async def stream_message(
@@ -173,7 +201,7 @@ async def stream_message(
         raise HTTPException(status_code=404, detail="Chat not found")
 
     # Build history & save user message
-    db_messages   = db.query(models.Message).filter(models.Message.chat_id == chat_id).all()
+    db_messages = db.query(models.Message).filter(models.Message.chat_id == chat_id).all()
     agent_messages = _build_agent_messages(chat_id, db_messages, message.content)
 
     user_content = json.dumps({"text": message.content})
@@ -183,7 +211,7 @@ async def stream_message(
     # Inter-thread communication
     trace_queue: q_module.Queue = q_module.Queue()
     result_holder: dict = {}
-    error_holder:  dict = {}
+    error_holder: dict = {}
 
     def agent_thread():
         try:
@@ -191,25 +219,23 @@ async def stream_message(
             result_holder["response"] = agent.run_agent(agent_messages, callbacks=[cb])
         except Exception as exc:
             error_holder["error"] = str(exc)
+            logger.error(f"Agent thread error: {exc}", exc_info=True)
         finally:
-            trace_queue.put(None)  # sentinel — signals generator to close
+            trace_queue.put(None)
 
     threading.Thread(target=agent_thread, daemon=True).start()
 
-    # SSE generator — polls the queue, yields events to the client
     async def generate():
-        # Yield a keepalive so the browser knows the connection is alive
         yield sse({"type": "connected"})
 
         while True:
             try:
                 event = trace_queue.get_nowait()
             except q_module.Empty:
-                await asyncio.sleep(0.08)   # poll every 80 ms
+                await asyncio.sleep(0.05)
                 continue
 
             if event is None:
-                # Agent thread finished — process result
                 if "error" in error_holder:
                     err_json = json.dumps({"text": f"Error: {error_holder['error']}"})
                     db_session = database.SessionLocal()
@@ -230,19 +256,23 @@ async def stream_message(
                         db_session.close()
                 else:
                     response = result_holder.get("response", {})
-                    result   = response.get("structured_response")
+                    result = response.get("structured_response")
                     files_data = {}
                     chat_dir = os.path.join("uploads", str(chat_id))
-                    # Load files explicitly listed in names_of_required_files
+
+                    # Load files asynchronously
                     for filename in (result.names_of_required_files if result else []):
                         file_path = os.path.join(chat_dir, filename)
                         if os.path.exists(file_path) and os.path.isfile(file_path):
                             try:
-                                with open(file_path, "r", encoding="utf8") as f:
-                                    files_data[filename] = f.read()
+                                content = await asyncio.to_thread(
+                                    lambda: open(file_path, "r", encoding="utf8").read()
+                                )
+                                files_data[filename] = content
                             except Exception as e:
-                                print(f"Error reading file {filename}: {e}")
-                    # Load all other JSON and CSV files in the chat directory
+                                logger.error(f"Error reading file {filename}: {e}")
+
+                    # Load all other JSON and CSV files
                     if os.path.exists(chat_dir):
                         for f_name in os.listdir(chat_dir):
                             if f_name.endswith('.json') or f_name.endswith('.csv'):
@@ -250,10 +280,13 @@ async def stream_message(
                                     file_path = os.path.join(chat_dir, f_name)
                                     if os.path.isfile(file_path):
                                         try:
-                                            with open(file_path, "r", encoding="utf8") as f:
-                                                files_data[f_name] = f.read()
+                                            content = await asyncio.to_thread(
+                                                lambda: open(file_path, "r", encoding="utf8").read()
+                                            )
+                                            files_data[f_name] = content
                                         except Exception as e:
-                                            print(f"Error reading file {f_name}: {e}")
+                                            logger.error(f"Error reading file {f_name}: {e}")
+
                     assistant_dict = {
                         "text": result.simple_response if result else "",
                         "html_code": result.html_code if result else "",
@@ -280,37 +313,35 @@ async def stream_message(
                         db_session.close()
                 break
 
-            # Normal trace event — relay straight to client
             yield sse(event)
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control":    "no-cache",
-            "X-Accel-Buffering": "no",   # Disable nginx buffering
-            "Connection":       "keep-alive",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         },
     )
 
 
-# ─── fallback non-streaming endpoint (kept for compatibility) ─
+# ─── Fallback Non-Streaming Endpoint ─────────────────────
 
 @app.post("/chats/{chat_id}/message", response_model=schemas.MessageResponse)
 def send_message(chat_id: int, message: schemas.MessageCreate, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
     chat = db.query(models.Chat).filter(models.Chat.id == chat_id, models.Chat.user_id == current_user.id).first()
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    db_messages    = db.query(models.Message).filter(models.Message.chat_id == chat_id).all()
+    db_messages = db.query(models.Message).filter(models.Message.chat_id == chat_id).all()
     agent_messages = _build_agent_messages(chat_id, db_messages, message.content)
     db.add(models.Message(chat_id=chat_id, role="user", content=json.dumps({"text": message.content})))
     db.commit()
     try:
         response = agent.run_agent(agent_messages)
-        result   = response["structured_response"]
+        result = response["structured_response"]
         files_data = {}
         chat_dir = os.path.join("uploads", str(chat_id))
-        # Load files explicitly listed in names_of_required_files
         for filename in (result.names_of_required_files if result else []):
             file_path = os.path.join(chat_dir, filename)
             if os.path.exists(file_path) and os.path.isfile(file_path):
@@ -318,8 +349,7 @@ def send_message(chat_id: int, message: schemas.MessageCreate, current_user: mod
                     with open(file_path, "r", encoding="utf8") as f:
                         files_data[filename] = f.read()
                 except Exception as e:
-                    print(f"Error reading file {filename}: {e}")
-        # Load all other JSON and CSV files in the chat directory
+                    logger.error(f"Error reading file {filename}: {e}")
         if os.path.exists(chat_dir):
             for f_name in os.listdir(chat_dir):
                 if f_name.endswith('.json') or f_name.endswith('.csv'):
@@ -330,7 +360,7 @@ def send_message(chat_id: int, message: schemas.MessageCreate, current_user: mod
                                 with open(file_path, "r", encoding="utf8") as f:
                                     files_data[f_name] = f.read()
                             except Exception as e:
-                                print(f"Error reading file {f_name}: {e}")
+                                logger.error(f"Error reading file {f_name}: {e}")
         assistant_dict = {
             "text": result.simple_response,
             "html_code": result.html_code,
@@ -344,6 +374,7 @@ def send_message(chat_id: int, message: schemas.MessageCreate, current_user: mod
         db.refresh(msg)
         return msg
     except Exception as e:
+        logger.error(f"Send message error: {e}", exc_info=True)
         msg = models.Message(chat_id=chat_id, role="assistant", content=json.dumps({"text": f"Error: {str(e)}"}))
         db.add(msg)
         db.commit()
@@ -351,7 +382,7 @@ def send_message(chat_id: int, message: schemas.MessageCreate, current_user: mod
         return msg
 
 
-# ─── file download endpoint ───────────────────────────────────
+# ─── File Download Endpoint ──────────────────────────────
 
 @app.get("/chats/{chat_id}/files/{filename}")
 def get_file(chat_id: int, filename: str, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
@@ -362,3 +393,10 @@ def get_file(chat_id: int, filename: str, current_user: models.User = Depends(au
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path)
+
+
+# ─── Health Check ────────────────────────────────────────
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "version": "2.0.0"}
