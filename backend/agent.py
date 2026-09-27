@@ -24,9 +24,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import InMemorySaver
 
-load_dotenv()
+# .env is the source of truth for this project. An OS-level OPENAI_BASE_URL
+# (set on this machine for other tools) would otherwise silently win and point
+# the agent at the wrong provider — so override ambient environment variables.
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -125,25 +127,34 @@ def analyze_data(file_path: str, query: str) -> str:
         return f"Error analyzing {file_path}: {str(e)}"
 
 @tool
-def create_chart(data: str, chart_type: str, title: str) -> str:
-    """Create a Plotly chart from JSON data and return the chart JSON."""
+def create_chart(data: str, chart_type: str, title: str, x: str = "", y: str = "") -> str:
+    """Create a Plotly chart from JSON data and return the chart JSON.
+
+    For bar/line/scatter charts pass column names via x and y
+    (e.g. x="column", y="mean") so axes are labelled correctly.
+    """
     import plotly.express as px
 
     try:
         data_dict = json.loads(data) if isinstance(data, str) else data
+        xy = {}
+        if x:
+            xy["x"] = x
+        if y:
+            xy["y"] = y
 
         if chart_type == "bar":
-            fig = px.bar(data_dict)
+            fig = px.bar(data_dict, **xy)
         elif chart_type == "line":
-            fig = px.line(data_dict)
+            fig = px.line(data_dict, **xy)
         elif chart_type == "scatter":
-            fig = px.scatter(data_dict)
+            fig = px.scatter(data_dict, **xy)
         elif chart_type == "pie":
-            fig = px.pie(data_dict)
+            fig = px.pie(data_dict, **xy)
         elif chart_type == "histogram":
-            fig = px.histogram(data_dict)
+            fig = px.histogram(data_dict, **xy)
         else:
-            fig = px.bar(data_dict)
+            fig = px.bar(data_dict, **xy)
 
         fig.update_layout(title=title, template="plotly_white")
         return fig.to_json()
@@ -159,7 +170,7 @@ model = ChatOpenAI(
     temperature=0,
     streaming=True,
     timeout=120,
-    max_retries=MAX_RETRIES,
+    max_retries=0,  # tenacity below owns retries (avoids 3×3 double-retry)
 )
 
 # ─── Retry Wrapper ───────────────────────────────────────
@@ -202,7 +213,9 @@ Example output: {"steps": ["scrape", "analyze", "visualize", "generate_html"]}""
             plan_text = plan_text.split("```")[1].split("```")[0]
 
         plan_data = json.loads(plan_text)
-        state["plan"] = plan_data.get("steps", ["analyze", "generate_html"])
+        allowed_steps = {"scrape", "analyze", "visualize", "generate_html"}
+        plan = [s for s in plan_data.get("steps", []) if s in allowed_steps]
+        state["plan"] = plan or ["analyze", "generate_html"]
         logger.info(f"Plan: {state['plan']}")
     except Exception as e:
         state["errors"].append(f"Planner error: {str(e)}")
@@ -251,9 +264,12 @@ def analyst_node(state: AgentState) -> AgentState:
     chat_dir = state["chat_dir"]
     data_files = []
 
+    # Files the pipeline itself writes — never treat them as input data.
+    artifacts = {"scraped_data.txt", "chart_data.json", "generated.html"}
+
     if os.path.exists(chat_dir):
         for f in os.listdir(chat_dir):
-            if f.endswith(('.csv', '.json', '.xlsx', '.txt')) and f != "scraped_data.txt":
+            if f.endswith(('.csv', '.json', '.xlsx', '.txt')) and f not in artifacts:
                 data_files.append(os.path.join(chat_dir, f))
 
     if not data_files and not state["raw_data"]:
@@ -273,17 +289,8 @@ def analyst_node(state: AgentState) -> AgentState:
         except Exception as e:
             state["errors"].append(f"Analysis error for {file_path}: {str(e)}")
 
-    if state["raw_data"]:
-        try:
-            temp_file = os.path.join(chat_dir, "scraped_data.txt")
-            if os.path.exists(temp_file):
-                result = analyze_data.invoke({
-                    "file_path": temp_file,
-                    "query": state["user_query"]
-                })
-                analysis_results["scraped_data"] = result
-        except Exception as e:
-            state["errors"].append(f"Raw data analysis error: {str(e)}")
+    # NOTE: scraped text goes straight to the storyteller via state["raw_data"];
+    # analyze_data only supports csv/json/xlsx, so it would just error on .txt.
 
     state["analysis"] = analysis_results
     return state
@@ -291,33 +298,55 @@ def analyst_node(state: AgentState) -> AgentState:
 # ─── Node: Visualizer ────────────────────────────────────
 
 def visualizer_node(state: AgentState) -> AgentState:
-    """Create chart data files from analysis results."""
+    """Create a chart from the numeric summary of the analyzed data."""
     if "visualize" not in state["plan"]:
         return state
 
     chat_dir = state["chat_dir"]
-    visualizations = []
+    os.makedirs(chat_dir, exist_ok=True)
+
+    # Build chart data from the mean of each numeric column in the analysis
+    # output — real data instead of placeholder values.
+    chart_data = None
+    for _name, payload in state["analysis"].items():
+        try:
+            result = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        summary = result.get("summary") or {}
+        means = {
+            col: stats.get("mean")
+            for col, stats in summary.items()
+            if isinstance(stats, dict) and stats.get("mean") is not None
+        }
+        if means:
+            chart_data = {"column": list(means.keys()), "mean": list(means.values())}
+            break
+
+    if not chart_data:
+        # Nothing numeric to chart — skip rather than emit a fake chart.
+        state["visualizations"] = []
+        return state
 
     try:
-        # Generate charts from analysis data
-        # In production, this would be more sophisticated
-        chart_data = {"x": [1, 2, 3, 4, 5], "y": [10, 20, 15, 25, 30]}
         chart_json = create_chart.invoke({
             "data": json.dumps(chart_data),
             "chart_type": "bar",
-            "title": "Analysis Overview"
+            "title": "Column Means",
+            "x": "column",
+            "y": "mean",
         })
 
         chart_file = os.path.join(chat_dir, "chart_data.json")
-        with open(chart_file, "w") as f:
+        with open(chart_file, "w", encoding="utf8") as f:
             f.write(chart_json)
 
-        visualizations.append("chart_data.json")
-        logger.info("Chart created")
+        state["visualizations"] = ["chart_data.json"]
+        logger.info("Chart created from analysis summary")
     except Exception as e:
         state["errors"].append(f"Visualization error: {str(e)}")
+        state["visualizations"] = []
 
-    state["visualizations"] = visualizations
     return state
 
 # ─── Node: Storyteller ───────────────────────────────────
@@ -326,13 +355,16 @@ def storyteller_node(state: AgentState) -> AgentState:
     """Generate the final HTML data story."""
     system_prompt = """You are a data storyteller. Create an engaging HTML data story.
 
-Requirements:
+Output format (strict):
+1. First write a 2-3 sentence plain-text summary of your findings for the user (no markdown, no code fences).
+2. Then, on a new line, output the complete HTML inside a ```html code block.
+
+Requirements for the HTML:
 - Single self-contained HTML file
-- Detective/mysthetic theme with smooth CSS animations
+- Detective/aesthetic theme with smooth CSS animations
 - Include Plotly.js via CDN for charts
 - Narrative structure: headline → mystery → insights → resolution
-- Embed chart data in <script> blocks (no external fetch)
-- Return the complete HTML code"""
+- Embed chart data in <script> blocks (no external fetch)"""
 
     context = f"""User Query: {state['user_query']}
 
@@ -353,13 +385,20 @@ Errors: {state['errors'] if state['errors'] else 'None'}"""
 
     try:
         response = llm_invoke(messages)
-        html_code = response.content.strip()
+        raw = response.content.strip()
 
-        if "```html" in html_code:
-            html_code = html_code.split("```html")[1].split("```")[0]
-        elif "```" in html_code:
-            html_code = html_code.split("```")[1].split("```")[0]
+        # Summary = plain text before the HTML code block; HTML = inside the block.
+        if "```html" in raw:
+            summary_text, rest = raw.split("```html", 1)
+            html_code = rest.split("```")[0]
+        elif "```" in raw:
+            summary_text, rest = raw.split("```", 1)
+            html_code = rest.split("```")[0]
+        else:
+            summary_text, html_code = "", raw
 
+        summary_text = summary_text.strip()
+        html_code = html_code.strip()
         state["html_output"] = html_code
 
         chat_dir = state["chat_dir"]
@@ -369,7 +408,7 @@ Errors: {state['errors'] if state['errors'] else 'None'}"""
 
         state["structured_response"] = GeneratedHTML(
             html_code=html_code,
-            simple_response="Data story generated successfully",
+            simple_response=summary_text or "Data story generated successfully",
             names_of_required_files=state["visualizations"],
             list_of_steps_you_did=state["plan"],
         )
@@ -405,8 +444,10 @@ def build_graph():
     graph.add_edge("visualizer", "storyteller")
     graph.add_edge("storyteller", END)
 
-    checkpointer = InMemorySaver()
-    return graph.compile(checkpointer=checkpointer)
+    # No checkpointer: every request is a one-shot run (no interrupts/resume).
+    # A shared InMemorySaver would (a) require a thread_id in config on every
+    # invoke and (b) leak checkpoints for all chats until the process restarts.
+    return graph.compile()
 
 # ─── Singleton Graph ─────────────────────────────────────
 
@@ -421,13 +462,15 @@ def get_graph():
 
 # ─── Main Entry Point ────────────────────────────────────
 
-def run_agent(messages, callbacks=None):
+def run_agent(messages, callbacks=None, chat_id=None):
     """
     Run the multi-agent pipeline.
 
     Args:
         messages: List of message dicts with 'role' and 'content'
         callbacks: Optional list of LangChain callbacks for tracing
+        chat_id: Chat ID used to resolve the uploads directory. If omitted,
+            it is recovered from the directory-context message.
 
     Returns:
         Dict with 'structured_response' key containing GeneratedHTML
@@ -442,14 +485,17 @@ def run_agent(messages, callbacks=None):
             user_query = msg.content
             break
 
-    # Get chat directory from messages
-    chat_dir = "uploads"
-    for msg in messages:
-        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, 'content', "")
-        match = re.search(r'uploads/(\d+)', content)
-        if match:
-            chat_dir = f"uploads/{match.group(1)}"
-            break
+    # Resolve the chat's private uploads directory.
+    if chat_id is not None:
+        chat_dir = f"uploads/{chat_id}"
+    else:
+        chat_dir = "uploads"
+        for msg in messages:
+            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, 'content', "")
+            match = re.search(r'uploads/(\d+)', content)
+            if match:
+                chat_dir = f"uploads/{match.group(1)}"
+                break
 
     initial_state = {
         "messages": [],
@@ -523,13 +569,21 @@ class TraceCallbackHandler(BaseCallbackHandler):
         self._llm_call_count += 1
         self._put("Thinking", f"LLM pass #{self._llm_call_count} — reasoning", "trace")
 
+    def on_chat_model_start(self, serialized, messages, **kwargs):
+        # ChatOpenAI emits on_chat_model_start, NOT on_llm_start.
+        self._llm_call_count += 1
+        self._put("Thinking", f"LLM pass #{self._llm_call_count} — reasoning", "trace")
+
+    def on_llm_error(self, error, **kwargs):
+        self._put("Error", str(error)[:120], "trace")
+
     def on_agent_action(self, action, **kwargs):
         tool_input = str(action.tool_input)
         preview = (tool_input[:120] + "…") if len(tool_input) > 120 else tool_input
         self._put("Tool", f"Calling {action.tool} → {preview}", "trace")
 
     def on_tool_start(self, serialized, input_str, **kwargs):
-        name = serialized.get("name", "tool")
+        name = serialized.get("name", "tool") if isinstance(serialized, dict) else "tool"
         self._put("Running", f"Executing {name}…", "trace")
 
     def on_tool_end(self, output, **kwargs):

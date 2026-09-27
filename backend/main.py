@@ -3,6 +3,7 @@ import json
 import asyncio
 import queue as q_module
 import threading
+import time
 import logging
 from typing import List
 
@@ -77,6 +78,12 @@ def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _read_text(path: str) -> str:
+    """Read a UTF-8 text file (run via asyncio.to_thread to avoid blocking)."""
+    with open(path, "r", encoding="utf8") as f:
+        return f.read()
+
+
 async def read_chat_files_async(chat_dir: str) -> dict:
     """Asynchronously read JSON and CSV files from chat directory."""
     files_data = {}
@@ -89,9 +96,7 @@ async def read_chat_files_async(chat_dir: str) -> dict:
             if os.path.isfile(file_path):
                 try:
                     # Use asyncio.to_thread for non-blocking file I/O
-                    content = await asyncio.to_thread(
-                        lambda: open(file_path, "r", encoding="utf8").read()
-                    )
+                    content = await asyncio.to_thread(_read_text, file_path)
                     files_data[f_name] = content
                 except Exception as e:
                     logger.error(f"Error reading file {f_name}: {e}")
@@ -216,7 +221,7 @@ async def stream_message(
     def agent_thread():
         try:
             cb = TraceCallbackHandler(trace_queue)
-            result_holder["response"] = agent.run_agent(agent_messages, callbacks=[cb])
+            result_holder["response"] = agent.run_agent(agent_messages, callbacks=[cb], chat_id=chat_id)
         except Exception as exc:
             error_holder["error"] = str(exc)
             logger.error(f"Agent thread error: {exc}", exc_info=True)
@@ -227,11 +232,18 @@ async def stream_message(
 
     async def generate():
         yield sse({"type": "connected"})
+        deadline = time.monotonic() + REQUEST_TIMEOUT
 
         while True:
             try:
                 event = trace_queue.get_nowait()
             except q_module.Empty:
+                if time.monotonic() > deadline:
+                    # Agent thread hung — fail the request instead of streaming forever.
+                    logger.error(f"Agent timed out after {REQUEST_TIMEOUT}s (chat {chat_id})")
+                    error_holder["error"] = f"Agent timed out after {REQUEST_TIMEOUT}s"
+                    trace_queue.put(None)
+                    continue
                 await asyncio.sleep(0.05)
                 continue
 
@@ -265,9 +277,7 @@ async def stream_message(
                         file_path = os.path.join(chat_dir, filename)
                         if os.path.exists(file_path) and os.path.isfile(file_path):
                             try:
-                                content = await asyncio.to_thread(
-                                    lambda: open(file_path, "r", encoding="utf8").read()
-                                )
+                                content = await asyncio.to_thread(_read_text, file_path)
                                 files_data[filename] = content
                             except Exception as e:
                                 logger.error(f"Error reading file {filename}: {e}")
@@ -280,9 +290,7 @@ async def stream_message(
                                     file_path = os.path.join(chat_dir, f_name)
                                     if os.path.isfile(file_path):
                                         try:
-                                            content = await asyncio.to_thread(
-                                                lambda: open(file_path, "r", encoding="utf8").read()
-                                            )
+                                            content = await asyncio.to_thread(_read_text, file_path)
                                             files_data[f_name] = content
                                         except Exception as e:
                                             logger.error(f"Error reading file {f_name}: {e}")
@@ -338,7 +346,7 @@ def send_message(chat_id: int, message: schemas.MessageCreate, current_user: mod
     db.add(models.Message(chat_id=chat_id, role="user", content=json.dumps({"text": message.content})))
     db.commit()
     try:
-        response = agent.run_agent(agent_messages)
+        response = agent.run_agent(agent_messages, chat_id=chat_id)
         result = response["structured_response"]
         files_data = {}
         chat_dir = os.path.join("uploads", str(chat_id))
