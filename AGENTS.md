@@ -42,13 +42,30 @@ The frontend hardcodes `http://localhost:8000` in `src/api/client.js` — there 
 ## Architecture
 
 - `backend/main.py` — FastAPI app; auth, chat CRUD, file upload, SSE streaming endpoint (`/chats/{id}/message/stream`)
-- `backend/agent.py` — LangChain agent with `PythonREPLTool`; uses `ChatOpenAI` via AIPIPE; structured output via Pydantic model (`GeneratedHTML`)
+- `backend/agent.py` — LangGraph multi-agent pipeline: **Router → Researcher⇄tools → Analyst⇄tools → Storyteller** (see below); `ChatOpenAI` via AIPIPE; structured output via Pydantic model (`GeneratedHTML`)
 - `backend/auth.py` — JWT (HS256), bcrypt hashing, 7-day token expiry
 - `backend/models.py` — SQLAlchemy models: `User`, `Chat`, `Message`
 - `backend/database.py` — SQLite engine at `backend/sql_app.db`
 - `frontend/src/pages/Dashboard.jsx` — main workspace: chat panel + Sandpack preview, SSE consumer
 - `frontend/src/components/QueryInputPage.jsx` — initial prompt / file upload
 - `frontend/src/api/client.js` — `apiFetch` helper, `API_BASE_URL` constant
+
+### Agent Orchestration (`backend/agent.py`)
+
+Five-node adaptive graph (LangGraph, no checkpointer — every request is one-shot):
+
+```
+router → [researcher ⇄ research_tools] → [analyst ⇄ analyst_tools] → storyteller → END
+            (conditional skip)                (one back-edge to researcher)
+```
+
+- **router** (LLM, JSON): decides if web research is needed; falls back to a URL/keyword heuristic on error. Skips the researcher when local files suffice.
+- **researcher** (ReAct loop, tools: `search_web`/`scrape_url`/`list_files`): gathers sourced facts, final message = `RESEARCH NOTES`. Search uses `ddgs` (no API key).
+- **analyst** (ReAct loop, tools: `list_files`/`analyze_data`/`group_stats`/`correlate`/`create_chart`/`save_table`): works from actual data — chart type chosen from column metadata, not hardcoded. Can end its message with `NEED_MORE_RESEARCH: …` to bounce back to the researcher **once** (`bounce_used` guard makes a second bounce impossible).
+- **storyteller** (single LLM call): plain-text summary + self-contained HTML (Plotly from `cdn.jsdelivr.net` — `cdn.plotly.com` is DNS-blocked on this network).
+- **Termination guarantees**: per-phase tool budgets (`RESEARCH_TOOL_BUDGET`/`ANALYST_TOOL_BUDGET`) force `tool_choice="none"` when exhausted, plus `recursion_limit`. A quality gate re-asks the analyst once if numeric data exists but no `chart_*`/`table_*` file was produced.
+- **File tools are containment-checked**: `chat_dir` arrives via `config["configurable"]` (injected into tools as `RunnableConfig`), never a module global — concurrent requests can't race.
+- Each phase injects its own system prompt at invoke time; shared `messages` state holds only the conversation (no prompt leakage between phases).
 
 ### Data Flow
 
@@ -61,7 +78,7 @@ The frontend hardcodes `http://localhost:8000` in `src/api/client.js` — there 
 
 ### Uploads Convention
 
-Each chat gets a directory `uploads/{chat_id}/`. The agent's system prompt instructs it to read/write only within this directory. Uploaded files and generated JSON/CSV artifacts live here. The `GET /chats/{id}/messages` endpoint dynamically merges file contents from disk into the message history.
+Each chat gets a directory `uploads/{chat_id}/`. All agent file tools resolve paths against this directory and reject anything outside it (server-side, not prompt-enforced). Uploaded files and generated artifacts (`chart_*.json`, `table_*.json`, `generated.html`) live here. The `GET /chats/{id}/messages` endpoint dynamically merges file contents from disk into the message history.
 
 ## Available Scripts
 
@@ -72,15 +89,16 @@ Each chat gets a directory `uploads/{chat_id}/`. The agent's system prompt instr
 | `npm run lint` | `frontend/` | ESLint (flat config) |
 | `uvicorn main:app --reload` | `backend/` | API dev server |
 
-## No Tests, No Backend Linting
+## No Test Framework, No Backend Linting
 
-- No test suite exists (no pytest config, no test files)
+- No pytest config / formal test suite. Two **manual verification scripts** exist in `backend/` (run from `backend/` with `python verify_file_flow.py` / `verify_research_flow.py`; each costs several LLM calls, writes to throwaway `uploads/9999x/` dirs, and asserts on steps, chart files, and trace events).
 - No Python formatter/linter configured (no ruff, black, mypy)
 - No type checking on backend
 - ESLint is configured for frontend only
 
 ## Key Gotchas
 
+- **`load_dotenv(override=True)` in `backend/agent.py` is load-bearing.** This machine has a user-level OS env var `OPENAI_BASE_URL=https://aipipe.org/openai/v1` that silently overrides `backend/.env`'s `openrouter` URL (wrong provider → "Model pricing unknown" failures). Never remove the `override=True`.
 - **JWT secret is hardcoded** in `backend/auth.py` (`SECRET_KEY = "HARLIVSINGH"`). Do not expose this in production.
 - **SSE streaming** uses threading + `queue.Queue`, not async generators. The `TraceCallbackHandler` bridges sync LangChain callbacks to the async SSE generator.
 - **Message content is JSON**, not plain text. Both user and assistant messages store JSON strings in the `content` column. The frontend parses with `JSON.parse`.

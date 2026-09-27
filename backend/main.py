@@ -39,7 +39,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-REQUEST_TIMEOUT = 300  # 5 minutes
+REQUEST_TIMEOUT = 600  # research flows (search/scrape + multi-step analysis) can legitimately take minutes
 
 
 # ─── Helpers ─────────────────────────────────────────────

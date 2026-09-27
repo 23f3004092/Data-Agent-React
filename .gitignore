@@ -28,6 +28,9 @@ pnpm-debug.log*
 # Local database
 backend/sql_app.db
 
+# Per-chat user uploads and generated artifacts
+backend/uploads/
+
 # OS files
 .DS_Store
 Thumbs.db
