@@ -3,7 +3,7 @@ uvicorn
 sqlalchemy
 python-multipart
 python-jose[cryptography]
-passlib[bcrypt]
+bcrypt
 langchain
 langchain_experimental
 langchain_openai
